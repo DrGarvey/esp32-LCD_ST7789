@@ -1,17 +1,19 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  ## Required IDF version
-  idf:
-    version: '>=4.1.0'
-  # # Put list of dependencies here
-  # # For components maintained by Espressif:
-  # component: "~1.0.0"
-  # # For 3rd party components:
-  # username/component: ">=1.0.0,<2.0.0"
-  # username2/component2:
-  #   version: "~1.0.0"
-  #   # For transient dependencies `public` flag can be set.
-  #   # `public` flag doesn't have an effect dependencies of the `main` component.
-  #   # All dependencies of `main` are public by default.
-  #   public: true
-  espressif/esp_lvgl_port: ^2.9.0
+  idf: ">=5.2"
+
+  # 表情播放引擎 esp_emote_gfx 是 LVGL 8 写的，而 esp_lvgl_port(^2.x) 用的是 LVGL 9，
+  # 两者不能共存。所以这里：锁死 LVGL 8，并且不再依赖 esp_lvgl_port。
+  lvgl/lvgl: "~8.3.0"
+
+  # 乐鑫表情播放器：挂载打包工具生成的 .bin 资源包并用 gfx_anim 播放。
+  # override_path 指向你克隆到 "Emote Pack/" 里的本地仓库。
+  espressif2022/esp_emote_gen_player:
+    version: "*"
+    override_path: "../Emote Pack/esp_emote_gen_player"
+
+  # esp_emote_gfx 也做成本地组件：我们给它打了补丁（gfx_anim.c 越界 start 帧钳制），
+  # 用 override_path 覆盖仓库版本，避免重新解析依赖时被覆盖掉补丁。
+  espressif2022/esp_emote_gfx:
+    version: "*"
+    override_path: "../Emote Pack/esp_emote_gfx"

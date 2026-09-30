@@ -1,128 +1,61 @@
 /* ============================================================================
- *  程序入口
+ *  表情逐个轮播演示
  * ----------------------------------------------------------------------------
- *  这个文件只负责「启动流程」和「表情库」，怎么画脸全在 ui.c 里。
- *  分开的好处：改表情不用动画脸的代码，改画脸也不会误碰表情数据。
+ *  流程：
+ *    上电 -> 初始化屏幕 + 表情播放器 -> 挂载 emote_gen 分区里的资源包
+ *         -> 按顺序循环播放包里的每一个表情，每个停 3 秒。
  *
- *  完整流程：
- *    上电 -> ESP-IDF 调用 app_main()
- *           |-- 初始化        屏幕 + LVGL 后台任务
- *           |-- 加锁          之后操作界面才安全
- *           |-- ui_create()   搭骨架（只做这一次）
- *           |-- ui_update()   先摆一个初始表情，不然屏幕是黑的
- *           |-- 解锁          交给后台任务持续刷新
- *           '-- 启动表情轮播任务
- *
- *  app_main 返回后程序不会结束：ESP-IDF 只删掉「main 任务」，
- *  LVGL 的后台任务和我们创建的任务都还在跑。
- *  这跟 Arduino / 裸机必须写 while(1) 是两种完全不同的模式。
+ *  表情来自乐鑫开源的 Emote Pack（你在打包工具里导出成了 emote-assets.bin），
+ *  一共 23 个。这里只是「逐个播放」，以后要按按键 / 传感器切换，
+ *  把 while 循环里那句 emote_gen_player_anim_now 换成「按条件挑一个 index」即可。
  * ========================================================================== */
 
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_lvgl_port.h"
-#include "bsp_lvgl.h"
-#include "ui.h"
+#include "esp_err.h"
+#include "esp_log.h"
 
-/* ============================================================================
- *  表情库
- * ----------------------------------------------------------------------------
- *  小狗的全部表情就是下面这张表，一行一个。
- *
- *  想加表情？照着抄一行，改数字，完事。
- *  想只看某一个表情？把另外几行注释掉，或者把 DEWELL 改大一点慢慢看。
- *
- *  字段顺序： 眼宽  眼高  眼距  眼偏移  嘴宽  嘴弯向
- * ----------------------------------------------------------------------------
- *  调节小抄（改完烧录就能看到效果）：
- *    眼睛不够大/太大   -> eye_w、eye_h
- *    两眼离得太近      -> eye_gap（这是中间那道缝的宽度，不是中心距）
- *    eye_h 比 eye_w 小 -> 眯眼；两者相等 -> 正圆
- *    嘴太宽/太窄       -> mouth_w（弧形嘴的弯曲深度也跟着一起变）
- *    嘴的弯向          -> mouth_dir：+1 笑 / -1 撇嘴 / 0 直线
- *    整张脸的上下位置  -> ui.c 里的 EYE_CENTER_Y、MOUTH_CENTER_Y
- * ========================================================================== */
-static const ui_data_t k_faces[] = {
-    /*   眼宽  眼高  眼距  眼偏移  嘴宽  嘴弯向 */
-    {      70,   70,   60,     0,    56,    0 },   /* 普通：圆眼 + 直线嘴 */
-    {      70,   26,   60,    -4,    96,   +1 },   /* 开心：眯眼 + 咧嘴笑 */
-    {      70,   40,   46,     8,    56,   -1 },   /* 生气：压低半眯 + 撇嘴 */
-};
+#include "emote_board.h"
+
+static const char *TAG = "emote_demo";
 
 /* 每个表情停留多久（毫秒） */
-#define FACE_DWELL_MS   2000
-
-/* ============================================================================
- *  表情轮播任务
- * ----------------------------------------------------------------------------
- *  它模拟的是这样一个流程：
- *      别的地方算出了新状态  ->  加锁  ->  ui_update()  ->  解锁
- *
- *  以后小狗要按传感器、按键、串口命令来换表情，
- *  就是把 k_faces[index] 换成「根据条件挑出来的那一个表情」，
- *  流程一模一样：加锁 -> ui_update -> 解锁。
- *
- *  ⚠ 为什么 ui_update() 要夹在 lock / unlock 之间？
- *     因为它会改控件，而 LVGL 后台任务此刻可能正在读同一批控件去画屏幕。
- *     一边改一边读，画面会撕裂、错位，甚至崩溃。
- * ------------------------------------------------------------------------- */
-static void face_show_task(void *arg)
-{
-    (void)arg;   /* 用不到这个参数，加一句告诉编译器「我知道它没用」 */
-
-    const int face_count = sizeof(k_faces) / sizeof(k_faces[0]);
-    int index = 0;
-
-    while (1) {
-        if (lvgl_port_lock(0)) {
-            ui_update(&k_faces[index]);
-            lvgl_port_unlock();
-        }
-
-        /* 换下一个表情；数到头就绕回第 0 个 */
-        index = (index + 1) % face_count;
-
-        /* 睡一会儿再进下一轮。vTaskDelay 只让当前任务睡，
-         * CPU 会去跑别的任务，不浪费。 */
-        vTaskDelay(pdMS_TO_TICKS(FACE_DWELL_MS));
-    }
-}
+#define EMOTE_DWELL_MS  3000
 
 void app_main(void)
 {
-    /* ---- 1. 初始化 ---- */
-    lv_display_t *disp = bsp_lvgl_init();
-    if (disp == NULL) {
-        /* 返回 NULL 表示初始化失败（比如内存不足）。
-         * 直接结束，避免后面拿着空句柄去用导致崩溃重启。 */
-        printf("LVGL 初始化失败\n");
+    emote_gen_player_handle_t player = emote_board_init();
+    if (player == NULL) {
+        ESP_LOGE(TAG, "表情播放器初始化失败");
         return;
     }
 
-    /* ---- 2. 加锁 ---- */
-    if (!lvgl_port_lock(0)) {
-        printf("获取 LVGL 锁失败\n");
+    size_t count = emote_gen_player_get_index_count(player);
+    ESP_LOGI(TAG, "资源包共 %u 个表情：", (unsigned)count);
+    for (size_t i = 0; i < count; i++) {
+        const emote_gen_player_index_entry_t *e =
+            emote_gen_player_get_index_entry(player, i);
+        if (e != NULL) {
+            ESP_LOGI(TAG, "  [%2u] %s", (unsigned)i, e->name);
+        }
+    }
+
+    if (count == 0) {
+        ESP_LOGE(TAG, "资源包是空的。请确认 emote_gen 分区已烧录 emote-assets.bin");
         return;
     }
 
-    /* ---- 3. 搭骨架 ----
-     * 只创建控件，还不给尺寸和位置。 */
-    ui_create(disp);
+    size_t idx = 0;
+    while (1) {
+        ESP_LOGI(TAG, "播放 [%u/%u]", (unsigned)idx, (unsigned)count);
+        /* repeat=true：当前表情的循环段一直放，直到切下一个 */
+        esp_err_t err = emote_gen_player_anim_now(player, idx, true);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "切换表情失败: %s", esp_err_to_name(err));
+        }
 
-    /* ---- 4. 摆第一个表情 ---- */
-    ui_update(&k_faces[0]);
-
-    /* ---- 5. 解锁 ---- */
-    lvgl_port_unlock();
-
-    /* ---- 6. 启动表情轮播任务 ----
-     * xTaskCreate 各参数依次是：
-     *   任务函数、任务名字（调试用）、栈大小（字节）、传给任务的参数、
-     *   优先级（数字越大越优先）、任务句柄（传 NULL = 我不需要管它）
-     */
-    xTaskCreate(face_show_task, "face_show", 4096, NULL, 5, NULL);
-
-    /* 到这里 app_main 就返回了。ESP-IDF 会删掉「main 任务」，
-     * 但 LVGL 后台任务和上面这个表情任务都还在跑，屏幕会一直刷新。 */
+        vTaskDelay(pdMS_TO_TICKS(EMOTE_DWELL_MS));
+        idx = (idx + 1) % count;
+    }
 }
