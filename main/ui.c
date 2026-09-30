@@ -1,239 +1,200 @@
 /* ============================================================================
- *  界面构建
+ *  小狗表情界面
  * ----------------------------------------------------------------------------
- *  这个文件对外只有两个函数（见 ui.h）：
- *    ui_create()  开机时调用一次，把界面搭出来。之后再没人碰它。
- *    ui_update()  之后反复调用，只改「内容」，不动界面结构。
+ *  对外只有两个函数（见 ui.h）：
+ *    ui_create()  开机调一次，把两只眼睛和一张嘴建出来。
+ *    ui_update()  之后反复调用，只改数字，不重建控件。
  *
- *  为什么要这么分？
- *    搭结构（创建控件、定位置）成本高，只在开机做一次；
- *    改内容（换一行字、换一个颜色）成本很低，可以每秒做几十次。
- *    把这两件事分开，界面就不会动不动重建，也不会闪。
- *
- *  组织方式：ui_create() 是总入口，它把界面拆成几块，每块交给一个小函数负责。
- *  这样界面变复杂时，你只是在下面多加一个 create_xxx() 函数，
- *  而不是往一个函数里继续塞代码。
- *
- *  LVGL 的控件是一棵树：屏幕是根节点，控件都是挂在它下面的子节点，
- *  控件还能有自己的子控件。子控件的位置相对父控件计算。
+ *  为什么不每次重建控件？
+ *    重建（create / delete）要申请释放内存、要重算布局，代价高，
+ *    而且画面会闪。改属性（set_size / set_style / align）代价很低，
+ *    一秒改几十次也没问题。所以：结构建一次，内容随便改。
  * ========================================================================== */
 
 #include "ui.h"
-#include <stdio.h>
 
 /* ---- 配色 ----
- * ⚠ lv_color_hex() 收的是 24 位 RGB888（0xRRGGBB），不是 RGB565！
- *   写成 RGB565 的 0xF800 会被当成「R=0x00, G=0xF8, B=0x00」而显示成绿色。
- *   要按 RGB565 写的话请用 lv_color_make(r8, g8, b8)。 */
-#define COLOR_BG        0x101820    /* 背景：深蓝灰 */
-#define COLOR_TITLE     0xFFFFFF    /* 标题：白 */
-#define COLOR_STATUS    0x93C5FD    /* 状态文字：浅蓝 */
-#define COLOR_COUNTER   0x4ADE80    /* 计数：亮绿 */
+ * ⚠ lv_color_hex() 收的是 24 位 RGB888（0xRRGGBB），不是 RGB565！ */
+#define COLOR_BG        0x000000    /* 背景：纯黑 */
+#define COLOR_FACE      0xFFFFFF    /* 五官：白 */
 
-/* ---- 色块尺寸 ----
- * 三个色块等间距排列，这里定义单个尺寸和间隔，
- * 下面的位置是算出来的，所以改这两个值不用手改坐标。 */
-#define BOX_SIZE        70
-#define BOX_GAP         8
+/* ---- 五官在屏幕上的位置 ----
+ * 写的是【相对屏幕中心】的偏移量，正数往下。
+ * 用相对位置而不是绝对坐标，横屏竖屏切换时这两行不用改。 */
+#define EYE_CENTER_Y    (-38)       /* 两眼中心线：屏幕中心往上 38 */
+#define MOUTH_CENTER_Y  ( 42)       /* 嘴的视觉中心：屏幕中心往下 42 */
 
-/* 三色块，用来一眼验证颜色顺序是否正确 */
-static const uint32_t k_box_colors[3] = { 0xFF0000, 0x00FF00, 0x0000FF };
-static const char    *k_box_names[3]  = { "RED", "GREEN", "BLUE" };
+/* ---- 嘴的线条粗细 ----
+ * 直线嘴拿它当高度，弧形嘴拿它当弧线宽度，这样两种嘴粗细一致。 */
+#define MOUTH_THICK     8
 
 /* ---------------------------------------------------------------------------
- * ui_update() 要改的控件
+ * 要反复改的控件
  * ---------------------------------------------------------------------------
- * ui_create() 创建控件时把指针存进这些变量，ui_update() 才能顺着它们找到控件。
- *
- * 为什么必须存成 static 全局变量？
- *   create_xxx() 里的局部变量（比如 lv_obj_t *title）在函数返回时就没了，
- *   而控件本身是 LVGL 动态分配的、还活着，我们只是【丢了找它的线索】。
- *   存到 static 变量里，线索就一直在。
+ * 这些指针必须存成 static 全局变量：create_xxx() 里的局部变量在函数返回时
+ * 就没了，而控件本身是 LVGL 动态分配的、还活着，我们只是【丢了找它的线索】。
  * ------------------------------------------------------------------------- */
-static lv_obj_t *s_title_label;     /* 顶部标题 */
-static lv_obj_t *s_status_label;    /* 底部状态文字 */
-static lv_obj_t *s_box[3];          /* 三个色块（容器） */
-static lv_obj_t *s_box_label[3];    /* 三个色块里的文字 */
+static lv_obj_t *s_eye[2];        /* 左眼、右眼 */
+static lv_obj_t *s_mouth_line;    /* 直线嘴（mouth_dir == 0 时显示） */
+static lv_obj_t *s_mouth_arc;     /* 弧形嘴（mouth_dir != 0 时显示） */
 
 /* ---------------------------------------------------------------------------
- * 定时器回调要用的状态
- * 必须放在函数外面：局部变量在函数返回后就销毁了，回调函数就找不到了。
- * 命名上的 s_ 前缀是习惯，表示 "static 变量"。
- * ------------------------------------------------------------------------- */
-static lv_obj_t *s_counter_label;   /* 指向底部那行计数文字 */
-static unsigned  s_seconds;         /* 已运行秒数 */
-
-/* ---------------------------------------------------------------------------
- * 定时器回调
+ * 眼睛
  * ---------------------------------------------------------------------------
- * 这个函数不是我们主动调的，是 LVGL 每秒钟替我们调一次。
- *
- * 它运行在 LVGL 的后台任务里，那时锁已经被 LVGL 自己持有，
- * 所以函数内部不需要（也不能）再加锁 —— 递归锁会死等。
+ * 用一个圆角矩形画。圆角半径设成 LV_RADIUS_CIRCLE（一个很大的值）之后，
+ * LVGL 会自动把它限制到「短边的一半」，于是：
+ *     宽 == 高  ->  正圆
+ *     宽 >  高  ->  胶囊形（左右两个半圆 + 中间一段直线）
+ * 所以一个矩形控件就够了，改数字就能在「圆眼」和「眯眼」之间连续变化，
+ * 不用换控件类型，以后做动画也能平滑过渡。
  * ------------------------------------------------------------------------- */
-static void counter_timer_cb(lv_timer_t *timer)
+static void create_eyes(lv_obj_t *parent)
 {
-    s_seconds++;                                    /* 秒数 +1 */
+    for (int i = 0; i < 2; i++) {
+        s_eye[i] = lv_obj_create(parent);
 
-    /* 和 printf 用法一样，%u 处填一个无符号整数 */
-    lv_label_set_text_fmt(s_counter_label, "Running: %u s", s_seconds);
-}
+        /* 圆角拉满 -> 正圆或胶囊 */
+        lv_obj_set_style_radius(s_eye[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
 
-/* ---------------------------------------------------------------------------
- * 第 1 块：标题
- * ---------------------------------------------------------------------------
- * 参数 parent 是父节点，标题会挂在它下面。
- * 把 parent 作为参数传进来，这个函数才能复用到别的地方。
- * ------------------------------------------------------------------------- */
-static void create_title(lv_obj_t *parent)
-{
-    /* lv_label_create 创建一个「文字控件」，父节点是 parent。
-     * 这次直接把返回值存进 s_title_label —— 以后 ui_update() 靠它找这个控件。 */
-    s_title_label = lv_label_create(parent);
+        /* 填充色 = 五官色；不要边框（容器默认带一条灰边框） */
+        lv_obj_set_style_bg_color(s_eye[i], lv_color_hex(COLOR_FACE), LV_PART_MAIN);
+        lv_obj_set_style_border_width(s_eye[i], 0, LV_PART_MAIN);
 
-    /* 先填一个初始文字。等 main.c 里第一次调 ui_update() 时会被覆盖掉。 */
-    lv_label_set_text(s_title_label, "LVGL + esp_lvgl_port");
-
-    /* 设置文字颜色。最后的 LV_PART_MAIN 指定「作用于控件的哪个部分」：
-     * 一个控件可以分主体、滚动条、指示器等多个部分，MAIN 就是主体。 */
-    lv_obj_set_style_text_color(s_title_label, lv_color_white(), LV_PART_MAIN);
-
-    /* 定位：LV_ALIGN_TOP_MID = 相对父节点顶部居中，
-     * 后面两个数是这个基础上的偏移量 (x, y)，
-     * y 轴向下为正，所以 10 表示再往下 10 像素。 */
-    lv_obj_align(s_title_label, LV_ALIGN_TOP_MID, 0, 10);
-}
-
-/* ---------------------------------------------------------------------------
- * 第 2 块：三个色块（每个色块里还有一行标签）
- * ---------------------------------------------------------------------------
- * 这段最能体现 LVGL 的「父子嵌套」：
- *   屏幕
- *    └─ 色块（容器）
- *        └─ 标签（文字）
- * 标签的父节点是色块，所以它会贴在色块里面、随色块移动。
- * ------------------------------------------------------------------------- */
-static void create_color_boxes(lv_obj_t *parent, int avail_width)
-{
-    /* 三个块排一行，总宽 = 3个块 + 2个间隔。
-     * 用屏幕实际宽度算起始 x，这样横屏/竖屏切换时不用改这里。 */
-    const int count    = 3;
-    const int total_w  = count * BOX_SIZE + (count - 1) * BOX_GAP;
-    const int start_x  = (avail_width - total_w) / 2;
-
-    for (int i = 0; i < count; i++) {
-        /* lv_obj_create 创建一个通用空白容器，父节点是 parent。
-         * 存进 s_box[i]，ui_update() 以后靠它改颜色。 */
-        s_box[i] = lv_obj_create(parent);
-
-        /* 尺寸：宽 BOX_SIZE、高 BOX_SIZE（正方形） */
-        lv_obj_set_size(s_box[i], BOX_SIZE, BOX_SIZE);
-
-        /* 位置：x 从 start_x 开始，每个往右挪 (块宽 + 间隔)；
-         * y 固定在 50，让三个块在同一水平线上 */
-        lv_obj_set_pos(s_box[i], start_x + i * (BOX_SIZE + BOX_GAP), 50);
-
-        /* 背景色。i 依次为 0/1/2，取到红/绿/蓝 */
-        lv_obj_set_style_bg_color(s_box[i], lv_color_hex(k_box_colors[i]), LV_PART_MAIN);
-
-        /* 去掉边框。容器默认带一条灰边框，不去掉色块边缘会有一圈灰 */
-        lv_obj_set_style_border_width(s_box[i], 0, LV_PART_MAIN);
-
-        /* 注意这里父节点是 s_box[i] 不是 parent —— 标签贴在色块「里面」 */
-        s_box_label[i] = lv_label_create(s_box[i]);
-        lv_label_set_text(s_box_label[i], k_box_names[i]);
-
-        /* 居中于父节点（也就是色块）。比手算偏移量省事得多 */
-        lv_obj_center(s_box_label[i]);
+        /* 去掉内边距。lv_obj 默认带 pad，不去掉的话实际可见的部分
+         * 会比设定值小一圈，眯眼时甚至可能被 pad 挤没。 */
+        lv_obj_set_style_pad_all(s_eye[i], 0, LV_PART_MAIN);
     }
 }
 
 /* ---------------------------------------------------------------------------
- * 第 3 块：状态文字（由 ui_update() 填内容）
+ * 嘴巴
+ * ---------------------------------------------------------------------------
+ * 准备了两个控件，同一时刻只显示其中一个：
+ *     s_mouth_line  扁的圆角矩形  =  直线嘴 ─
+ *     s_mouth_arc   lv_arc 的弧   =  弯的嘴 ⌣ / ⌢
+ *
+ * 为什么不干脆全用弧？
+ *     0 度画不出直线，所以直线只能另外用矩形表示。两个控件切换一下很简单。
+ *
+ * ⚠ lv_arc 这个控件默认会画三样东西：
+ *       背景弧（我们要的） + 值弧（进度条那种） + 旋钮（一个小圆点）
+ *   后两样必须关掉，否则嘴上会凭空多出一个圆点。
  * ------------------------------------------------------------------------- */
-static void create_status(lv_obj_t *parent)
+static void create_mouth(lv_obj_t *parent)
 {
-    s_status_label = lv_label_create(parent);
+    /* ---------------- 直线嘴 ---------------- */
+    s_mouth_line = lv_obj_create(parent);
 
-    /* 和色块一样，先给个初始值，第一次 ui_update() 会覆盖它 */
-    lv_label_set_text(s_status_label, "-");
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(COLOR_STATUS), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_mouth_line, lv_color_hex(COLOR_FACE), LV_PART_MAIN);
+    lv_obj_set_style_radius(s_mouth_line, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_mouth_line, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_mouth_line, 0, LV_PART_MAIN);
 
-    /* 底部靠上的位置。往上 -50 是为了给下面那行计数让出地方，
-     * 这样两个标签不会叠在一起。 */
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -50);
+    /* ---------------- 弧形嘴 ---------------- */
+    s_mouth_arc = lv_arc_create(parent);
+
+    /* 控件自身的方块底色去掉，不然屏幕上会出现一个方块 */
+    lv_obj_set_style_bg_opa(s_mouth_arc, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_mouth_arc, 0, LV_PART_MAIN);
+
+    /* 背景弧 —— 这才是我们要画的嘴 */
+    lv_obj_set_style_arc_color(s_mouth_arc, lv_color_hex(COLOR_FACE), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_mouth_arc, MOUTH_THICK, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(s_mouth_arc, true, LV_PART_MAIN);
+
+    /* 关掉旋钮（那个小圆点）和值弧。
+     * 这两句漏了，嘴上就会多出一个圆点，很容易以为是画错了。 */
+    lv_obj_remove_style(s_mouth_arc, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_opa(s_mouth_arc, LV_OPA_TRANSP, LV_PART_INDICATOR);
+
+    /* 内边距会从弧的半径里被扣掉，不去掉的话弧会比设定的小一圈 */
+    lv_obj_set_style_pad_all(s_mouth_arc, 0, LV_PART_MAIN);
 }
 
 /* ---------------------------------------------------------------------------
- * 第 4 块：底部的计数文字
- * ------------------------------------------------------------------------- */
-static void create_counter(lv_obj_t *parent)
-{
-    s_counter_label = lv_label_create(parent);
-
-    lv_label_set_text(s_counter_label, "Running: 0 s");
-    lv_obj_set_style_text_color(s_counter_label, lv_color_hex(COLOR_COUNTER), LV_PART_MAIN);
-
-    /* 底部居中。偏移 -20 表示往上 20 像素（y 轴向下为正，所以负数是向上） */
-    lv_obj_align(s_counter_label, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    /* 注册定时器：每 1000 毫秒调用一次 counter_timer_cb。
-     * 这行立即返回，不会在这里等；到点由 LVGL 后台任务负责调用。
-     * 第三个参数 NULL 表示不给回调传附加数据。 */
-    lv_timer_create(counter_timer_cb, 1000, NULL);
-}
-
-/* ---------------------------------------------------------------------------
- * 总入口：把上面的几块拼起来
+ * 搭骨架：只在开机时调一次
  * ------------------------------------------------------------------------- */
 void ui_create(lv_display_t *disp)
 {
-    /* 取出这块屏幕的根节点。
-     * 所有控件都要挂在它下面才会被显示出来。 */
+    /* 屏幕根节点，所有控件都要挂在它下面才会显示出来 */
     lv_obj_t *scr = lv_display_get_screen_active(disp);
 
-    /* 屏幕的实际宽度（横屏是 320，竖屏是 240）。
-     * 从 display 的 API 取比从控件对象上取更可靠。 */
-    const int scr_w = lv_display_get_horizontal_resolution(disp);
-
-    /* 设置屏幕背景色 */
     lv_obj_set_style_bg_color(scr, lv_color_hex(COLOR_BG), LV_PART_MAIN);
 
-    /* 依次创建各块内容。
-     * 想把界面做复杂，就是在这里多加几行调用而已。 */
-    create_title(scr);
-    create_status(scr);
-    create_color_boxes(scr, scr_w);
-    create_counter(scr);
+    create_eyes(scr);
+    create_mouth(scr);
+
+    /* 注意这里【没有】设定眼睛和嘴的尺寸、位置。
+     * 那些全在 ui_update() 里，由第一次调用决定。
+     * 所以 ui_create() 之后必须马上调一次 ui_update()，否则屏幕是全黑的。 */
 }
 
 /* ---------------------------------------------------------------------------
- * 刷新界面内容
+ * 换表情
  * ---------------------------------------------------------------------------
- * 每次调用都做三件事：
- *   1. 把 data->title 写进标题
- *   2. 把 data->status 写进状态栏
- *   3. 把三个色块的颜色和文字换掉
+ * ⚠ 前提：调用者已经持有 LVGL 锁。这个函数自己不加锁。
+ *   约定：谁调用谁加锁。
  *
- * ⚠ 前提：调用者已经持有 LVGL 锁。这个函数内部【不会】自己加锁，
- *   因为锁是可以嵌套的（递归锁），在已经持锁的情况下再加一次也不会死锁，
- *   但那样容易让人搞不清到底该由谁负责加锁。约定：谁调用谁加锁。
- *
- * ⚠ 这里只 set 属性，没有 create/delete 任何控件 —— 这是关键。
- *   lv_obj_delete() 会真把对象销毁掉，如果删的正是 LVGL 正在绘制的东西，
- *   后果很难预料。日常刷新界面完全不需要删控件，改内容就够了。
+ * 这里只 set 属性，不 create / delete 任何控件 —— 这是关键。
  * ------------------------------------------------------------------------- */
-void ui_update(const ui_data_t *data)
+void ui_update(const ui_data_t *f)
 {
-    /* 标题和状态栏：换一行字而已 */
-    lv_label_set_text(s_title_label, data->title);
-    lv_label_set_text(s_status_label, data->status);
+    /* ===================== 眼睛 ===================== */
 
-    /* 三个色块：颜色和文字一起换。
-     * 注意色块里的文字必须跟着颜色一起改，否则会出现
-     * 「绿色的块上写着 RED」这种对不上的情况。 */
-    for (int i = 0; i < 3; i++) {
-        lv_obj_set_style_bg_color(s_box[i], lv_color_hex(data->box_colors[i]), LV_PART_MAIN);
-        lv_label_set_text(s_box_label[i], data->box_names[i]);
+    /* 1. 定形状 */
+    for (int i = 0; i < 2; i++) {
+        lv_obj_set_size(s_eye[i], f->eye_w, f->eye_h);
+    }
+
+    /* 2. 定位置。两眼关于屏幕中心左右对称，所以左眼偏移取负、右眼取正。
+     *    偏移量 = 眼距的一半 + 眼宽的一半
+     *    （眼距算的是【内侧空隙】，所以还要再让出半只眼的宽度） */
+    const int32_t dx = f->eye_gap / 2 + f->eye_w / 2;
+
+    /* LV_ALIGN_CENTER：先把控件中心对准父控件（这里是屏幕）的中心，
+     * 再加上后面的偏移量。 */
+    lv_obj_align(s_eye[0], LV_ALIGN_CENTER, -dx, EYE_CENTER_Y + f->eye_dy);
+    lv_obj_align(s_eye[1], LV_ALIGN_CENTER,  dx, EYE_CENTER_Y + f->eye_dy);
+
+    /* ===================== 嘴巴 ===================== */
+    if (f->mouth_dir == 0) {
+        /* ---------------- 直线嘴 ---------------- */
+        lv_obj_remove_flag(s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag   (s_mouth_arc,  LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_set_size(s_mouth_line, f->mouth_w, MOUTH_THICK);
+        lv_obj_align(s_mouth_line, LV_ALIGN_CENTER, 0, MOUTH_CENTER_Y);
+    }
+    else {
+        /* ---------------- 弧形嘴 ---------------- */
+        lv_obj_add_flag   (s_mouth_line, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_mouth_arc,  LV_OBJ_FLAG_HIDDEN);
+
+        /* 弧是画在控件的【内切圆】上的，所以控件必须做成正方形：
+         *     边长 = 嘴宽  ->  半径 = 嘴宽/2  ->  弧深 = 嘴宽/2 */
+        lv_obj_set_size(s_mouth_arc, f->mouth_w, f->mouth_w);
+
+        /* 角度按【顺时针】算，0° 在 3 点钟方向：
+         *     0° -> 90°(6点钟) -> 180°(9点钟)
+         *        经过屏幕底部，所以是下半弧 ⌣，也就是笑
+         *   180° -> 270°(12点钟) -> 360°(3点钟)
+         *        经过屏幕顶部，所以是上半弧 ⌢，也就是撇嘴
+         * （360° 内部会被换算成 0°，环形的角度处理是对的，不用管它） */
+        if (f->mouth_dir > 0) {
+            lv_arc_set_bg_angles(s_mouth_arc, 0, 180);      /* 笑 */
+        }
+        else {
+            lv_arc_set_bg_angles(s_mouth_arc, 180, 360);    /* 撇嘴 */
+        }
+
+        /* 控件是正方形的，但只有一半看得见。所以要挪一下控件，
+         * 让【看得见的那一半】落在 MOUTH_CENTER_Y 上，
+         * 而不是让控件中心落在那里。
+         * 挪的距离 = 半径/2 = 嘴宽/4 */
+        const int32_t shift = f->mouth_w / 4;
+        const int32_t off   = (f->mouth_dir > 0)
+                            ? (MOUTH_CENTER_Y - shift)   /* 下半弧在中心之下 */
+                            : (MOUTH_CENTER_Y + shift);  /* 上半弧在中心之上 */
+        lv_obj_align(s_mouth_arc, LV_ALIGN_CENTER, 0, off);
     }
 }
